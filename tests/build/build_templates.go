@@ -1,8 +1,10 @@
 package build
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -209,6 +211,27 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build", "
 					GinkgoWriter.Printf("records for PipelineRun %s:\n%s\n", pipelineRun.Name, records)
 					Expect(err).NotTo(HaveOccurred(), "got error getting records for PipelineRun %s: %v", pipelineRun.Name, err)
 					Expect(len(records.Record)).NotTo(BeZero(), "No records found for PipelineRun %s", pipelineRun.Name)
+				})
+
+				It("should fetch the result from proxy endpoint", Label("xxxx"), func() {
+					user, err := framework.NewFramework(utils.GetGeneratedNamespace("sandbox-test"))
+					Expect(err).NotTo(HaveOccurred())
+
+					err = kubeadminClient.CommonController.CreateProxyPlugin("openshift-console", "toolchain-host-operator", "console", "openshift-console")
+					Expect(err).NotTo(HaveOccurred())
+					userToken := user.UserAccessToken
+
+					proxyRoute, err := kubeadminClient.CommonController.GetOpenshiftRoute("api", "toolchain-host-operator")
+					Expect(err).NotTo(HaveOccurred())
+					proxyApiUrl := fmt.Sprintf("https://%s/plugins/openshift-console", proxyRoute.Spec.Host)
+
+					req, err := http.NewRequest(http.MethodGet, proxyApiUrl, bytes.NewBufferString("hello test"))
+					Expect(err).NotTo(HaveOccurred())
+
+					req.Header.Set("Content-Type", "application/json")
+					req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", userToken))
+					_, err = f.SandboxController.HttpClient.Do(req)
+					Expect(err).NotTo(HaveOccurred())
 				})
 
 				It("should have Pipeline Logs", func() {

@@ -48,6 +48,7 @@ type K8SClient struct {
 	SandboxController *sandbox.SandboxController
 	UserName          string
 	UserNamespace     string
+	UserAccessToken   string
 }
 
 var (
@@ -136,6 +137,7 @@ func NewDevSandboxProxyClient(userName string) (*K8SClient, error) {
 		AsKubeDeveloper:   sandboxProxyClient,
 		UserName:          userAuthInfo.UserName,
 		UserNamespace:     userAuthInfo.UserNamespace,
+		UserAccessToken:   userAuthInfo.UserAccessToken,
 		SandboxController: sandboxController,
 	}, nil
 }

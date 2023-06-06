@@ -71,6 +71,9 @@ type SandboxUserAuthInfo struct {
 
 	// Add a description about kubeconfigpath
 	KubeconfigPath string
+
+	// user access token
+	UserAccessToken string
 }
 
 // Values to create a valid user for testing purposes
@@ -193,9 +196,10 @@ func (s *SandboxController) GetKubeconfigPathForSpecificUser(toolchainApiUrl str
 	}
 
 	return &SandboxUserAuthInfo{
-		UserName:       userName,
-		UserNamespace:  ns,
-		KubeconfigPath: kubeconfigPath,
+		UserName:        userName,
+		UserNamespace:   ns,
+		KubeconfigPath:  kubeconfigPath,
+		UserAccessToken: keycloakAuth.AccessToken,
 	}, nil
 }
 
