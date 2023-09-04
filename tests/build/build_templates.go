@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/devfile/library/v2/pkg/util"
@@ -25,161 +23,19 @@ import (
 	"github.com/konflux-ci/e2e-tests/pkg/utils/tekton"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/openshift/library-go/pkg/image/reference"
-
-	tektonpipeline "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
-
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
-	remoteimg "github.com/google/go-containerregistry/pkg/v1/remote"
-
+	"github.com/redhat-appstudio/application-api/api/v1alpha1"
+	kubeapi "github.com/redhat-appstudio/e2e-tests/pkg/apis/kubernetes"
+	"github.com/redhat-appstudio/e2e-tests/pkg/constants"
+	"github.com/redhat-appstudio/e2e-tests/pkg/framework"
+	"github.com/redhat-appstudio/e2e-tests/pkg/utils"
+	"github.com/redhat-appstudio/e2e-tests/pkg/utils/build"
+	"github.com/redhat-appstudio/e2e-tests/pkg/utils/pipeline"
+	"github.com/redhat-appstudio/e2e-tests/pkg/utils/tekton"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/yaml"
 )
 
-var (
-	ecPipelineRunTimeout = time.Duration(10 * time.Minute)
-)
-
-const pipelineCompletionRetries = 2
-
-type TestBranches struct {
-	RepoName       string
-	BranchName     string
-	PacBranchName  string
-	BaseBranchName string
-}
-
-var pacAndBaseBranches []TestBranches
-
-func CreateComponent(commonCtrl *common.SuiteController, ctrl *has.HasController, applicationName, componentName, namespace string, scenario ComponentScenarioSpec) {
-	var err error
-	var buildPipelineAnnotation map[string]string
-	var baseBranchName, pacBranchName string
-	Expect(scenario.PipelineBundleNames).Should(HaveLen(1))
-	pipelineBundleName := scenario.PipelineBundleNames[0]
-	Expect(pipelineBundleName).ShouldNot(BeEmpty())
-	customBuildBundle := getDefaultPipeline(pipelineBundleName)
-
-	if scenario.EnableHermetic {
-		//Update the docker-build pipeline bundle with param hermetic=true
-		customBuildBundle, err = enableHermeticBuildInPipelineBundle(customBuildBundle, pipelineBundleName, scenario.PrefetchInput)
-		if err != nil {
-			GinkgoWriter.Printf("failed to enable hermetic build in the pipeline bundle with: %v\n", err)
-			return
-		}
-	}
-
-	if scenario.CheckAdditionalTags {
-		//Update the pipeline bundle to apply additional tags
-		customBuildBundle, err = applyAdditionalTagsInPipelineBundle(customBuildBundle, pipelineBundleName, additionalTags)
-		if err != nil {
-			GinkgoWriter.Printf("failed to apply additinal tags in the pipeline bundle with: %v\n", err)
-			return
-		}
-	}
-
-	if customBuildBundle == "" {
-		// "latest" is a special value that causes the build service to consult the use one of the
-		// bundles specified in the build-pipeline-config ConfigMap in the build-service Namespace.
-		customBuildBundle = "latest"
-	}
-	buildPipelineAnnotation = map[string]string{
-		"build.appstudio.openshift.io/pipeline": fmt.Sprintf(`{"name":"%s", "bundle": "%s"}`, pipelineBundleName, customBuildBundle),
-	}
-
-	baseBranchName = fmt.Sprintf("base-%s", util.GenerateRandomString(6))
-	pacBranchName = constants.PaCPullRequestBranchPrefix + componentName
-
-	if scenario.Revision == gitRepoContainsSymlinkBranchName {
-		revision := symlinkBranchRevision
-		err = commonCtrl.Github.CreateRef(utils.GetRepoName(scenario.GitURL), gitRepoContainsSymlinkBranchName, revision, baseBranchName)
-		Expect(err).ShouldNot(HaveOccurred())
-		pacAndBaseBranches = append(pacAndBaseBranches, TestBranches{
-			RepoName:       utils.GetRepoName(scenario.GitURL),
-			BranchName:     gitRepoContainsSymlinkBranchName,
-			PacBranchName:  pacBranchName,
-			BaseBranchName: baseBranchName,
-		})
-	} else {
-		err = commonCtrl.Github.CreateRef(utils.GetRepoName(scenario.GitURL), "main", scenario.Revision, baseBranchName)
-		Expect(err).ShouldNot(HaveOccurred())
-		pacAndBaseBranches = append(pacAndBaseBranches, TestBranches{
-			RepoName:       utils.GetRepoName(scenario.GitURL),
-			BranchName:     "main",
-			PacBranchName:  pacBranchName,
-			BaseBranchName: baseBranchName,
-		})
-	}
-
-	componentObj := appservice.ComponentSpec{
-		ComponentName: componentName,
-		Source: appservice.ComponentSource{
-			ComponentSourceUnion: appservice.ComponentSourceUnion{
-				GitSource: &appservice.GitSource{
-					URL:           scenario.GitURL,
-					Revision:      baseBranchName,
-					Context:       scenario.ContextDir,
-					DockerfileURL: scenario.DockerFilePath,
-				},
-			},
-		},
-	}
-
-	if os.Getenv(constants.CUSTOM_SOURCE_BUILD_PIPELINE_BUNDLE_ENV) != "" {
-		customSourceBuildBundle := os.Getenv(constants.CUSTOM_SOURCE_BUILD_PIPELINE_BUNDLE_ENV)
-		Expect(customSourceBuildBundle).ShouldNot(BeEmpty())
-		buildPipelineAnnotation = map[string]string{
-			"build.appstudio.openshift.io/pipeline": fmt.Sprintf(`{"name":"%s", "bundle": "%s"}`, pipelineBundleName, customSourceBuildBundle),
-		}
-	}
-	c, err := ctrl.CreateComponent(componentObj, namespace, "", "", applicationName, false, utils.MergeMaps(constants.ComponentPaCRequestAnnotation, buildPipelineAnnotation))
-	Expect(err).ShouldNot(HaveOccurred())
-	Expect(c.Name).Should(Equal(componentName))
-}
-
-func getDefaultPipeline(pipelineBundleName string) string {
-	switch pipelineBundleName {
-	case "docker-build":
-		return os.Getenv(constants.CUSTOM_DOCKER_BUILD_PIPELINE_BUNDLE_ENV)
-	case "docker-build-oci-ta":
-		return os.Getenv(constants.CUSTOM_DOCKER_BUILD_OCI_TA_PIPELINE_BUNDLE_ENV)
-	case "docker-build-multi-platform-oci-ta":
-		return os.Getenv(constants.CUSTOM_DOCKER_BUILD_OCI_MULTI_PLATFORM_TA_PIPELINE_BUNDLE_ENV)
-	case "fbc-builder":
-		return os.Getenv(constants.CUSTOM_FBC_BUILDER_PIPELINE_BUNDLE_ENV)
-	default:
-		return ""
-	}
-}
-
-func WaitForPipelineRunStarts(hub *framework.ControllerHub, applicationName, componentName, namespace string, timeout time.Duration) string {
-	namespacedName := fmt.Sprintf("%s/%s", namespace, componentName)
-	timeoutMsg := fmt.Sprintf(
-		"timed out when waiting for the PipelineRun to start for the Component %s", namespacedName)
-	var prName string
-	Eventually(func() error {
-		pipelineRun, err := hub.HasController.GetComponentPipelineRun(componentName, applicationName, namespace, "")
-		if err != nil {
-			GinkgoWriter.Printf("PipelineRun has not been created yet for Component %s\n", namespacedName)
-			return err
-		}
-		if !pipelineRun.HasStarted() {
-			return fmt.Errorf("pipelinerun %s/%s has not started yet", pipelineRun.GetNamespace(), pipelineRun.GetName())
-		}
-		err = hub.TektonController.AddFinalizerToPipelineRun(pipelineRun, constants.E2ETestFinalizerName)
-		if err != nil {
-			return fmt.Errorf("error while adding finalizer %q to the pipelineRun %q: %v",
-				constants.E2ETestFinalizerName, pipelineRun.GetName(), err)
-		}
-		prName = pipelineRun.GetName()
-		return nil
-	}, timeout, constants.PipelineRunPollingInterval).Should(Succeed(), timeoutMsg)
-	return prName
-}
-
-var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", "build-templates", "HACBS"), func() {
+var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", "HACBS"), func() {
 	var f *framework.Framework
 	var err error
 	AfterEach(framework.ReportFailure(&f))
@@ -337,8 +193,7 @@ var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", 
 			It(fmt.Sprintf("should eventually finish successfully for component with Git source URL %s and Pipeline %s", scenario.GitURL, pipelineBundleName), Label(buildTemplatesTestLabel, sourceBuildTestLabel), func() {
 				component, err := kubeadminClient.HasController.GetComponent(componentName, testNamespace)
 				Expect(err).ShouldNot(HaveOccurred())
-				Expect(kubeadminClient.HasController.WaitForComponentPipelineToBeFinished(component, "",
-					kubeadminClient.TektonController, &has.RetryOptions{Retries: pipelineCompletionRetries, Always: true}, nil)).To(Succeed())
+				Expect(kubeadminClient.HasController.WaitForComponentPipelineToBeFinished(component, "", 2, f.AsKubeAdmin.TektonController)).To(Succeed())
 			})
 
 			It(fmt.Sprintf("should ensure SBOM is shown for component with Git source URL %s and Pipeline %s", scenario.GitURL, pipelineBundleName), Label(buildTemplatesTestLabel), func() {
@@ -446,7 +301,7 @@ var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", 
 					regProxyUrl := fmt.Sprintf("%s/plugins/tekton-results", f.ProxyUrl)
 					resultClient = pipeline.NewClient(regProxyUrl, f.UserToken)
 
-					pr, err = kubeadminClient.HasController.GetComponentPipelineRun(componentName, applicationName, testNamespace, "")
+					pr, err = f.AsKubeDeveloper.HasController.GetComponentPipelineRun(componentNames[i], applicationName, testNamespace, "")
 					Expect(err).ShouldNot(HaveOccurred())
 				})
 
@@ -517,10 +372,20 @@ var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", 
 					}
 				})
 
+					}
+					Expect(outputImage).ToNot(BeEmpty(), "output image of a component could not be found")
+					for _, r := range pipelineRun.Status.PipelineResults {
+						if r.Name == "IMAGE_DIGEST" {
+							outputImageDigest = r.Value.StringVal
+						}
+					}
+					Expect(outputImageDigest).ToNot(BeEmpty(), "digest of output image could not be found")
+				})
 				It("verify-enterprise-contract check should pass", Label(buildTemplatesTestLabel), func() {
 					// If the Tekton Chains controller is busy, it may take longer than usual for it
 					// to sign and attest the image built in BeforeAll.
-					err = kubeadminClient.TektonController.AwaitAttestationAndSignature(imageWithDigest, constants.ChainsAttestationTimeout)
+					imageWithDigest := fmt.Sprintf("%s@%s", outputImage, outputImageDigest)
+					err := kubeadminClient.TektonController.AwaitAttestationAndSignature(imageWithDigest, time.Duration(10)*time.Minute)
 					Expect(err).ToNot(HaveOccurred())
 
 					cm, err := kubeadminClient.CommonController.GetConfigMap("ec-defaults", "enterprise-contract-service")
@@ -585,7 +450,7 @@ var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", 
 					pr, err = kubeadminClient.TektonController.RunPipeline(generator, testNamespace, int(ecPipelineRunTimeout.Seconds()))
 					Expect(err).NotTo(HaveOccurred())
 
-					Expect(kubeadminClient.TektonController.WatchPipelineRun(pr.Name, testNamespace, int(ecPipelineRunTimeout.Seconds()))).To(Succeed())
+					Expect(kubeadminClient.TektonController.WatchPipelineRun(pr.Name, testNamespace, ecPipelineRunTimeout)).To(Succeed())
 
 					pr, err = kubeadminClient.TektonController.GetPipelineRun(pr.Name, pr.Namespace)
 					Expect(err).NotTo(HaveOccurred())
@@ -595,7 +460,34 @@ var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", 
 					Expect(tekton.DidTaskRunSucceed(tr)).To(BeTrue())
 					Expect(tr.Status.TaskRunStatusFields.Results).Should(
 						ContainElements(tekton.MatchTaskRunResultWithJSONPathValue(constants.TektonTaskTestOutputName, "{$.result}", `["SUCCESS"]`)),
-					)
+					))
+				})
+				It("contains non-empty sbom files", Label(buildTemplatesTestLabel), func() {
+					purl, cyclonedx, err := build.GetParsedSbomFilesContentFromImage(outputImage)
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(cyclonedx.BomFormat).To(Equal("CycloneDX"))
+					Expect(cyclonedx.SpecVersion).ToNot(BeEmpty())
+					Expect(cyclonedx.Version).ToNot(BeZero())
+					Expect(cyclonedx.Components).ToNot(BeEmpty())
+
+					numberOfLibraryComponents := 0
+					for _, component := range cyclonedx.Components {
+						Expect(component.Name).ToNot(BeEmpty())
+						Expect(component.Type).ToNot(BeEmpty())
+
+						if component.Type == "library" || component.Type == "application" {
+							Expect(component.Purl).ToNot(BeEmpty())
+							numberOfLibraryComponents++
+						}
+					}
+
+					Expect(purl.ImageContents.Dependencies).ToNot(BeEmpty())
+					Expect(purl.ImageContents.Dependencies).To(HaveLen(numberOfLibraryComponents))
+
+					for _, dependency := range purl.ImageContents.Dependencies {
+						Expect(dependency.Purl).ToNot(BeEmpty())
+					}
 				})
 			})
 
@@ -697,152 +589,8 @@ var _ = framework.BuildSuiteDescribe("Build templates E2E test", Label("build", 
 		It(fmt.Sprintf("pipelineRun should fail for symlink component with Git source URL %s with component name %s", pythonComponentGitHubURL, symlinkComponentName), Label(buildTemplatesTestLabel, sourceBuildTestLabel), func() {
 			component, err := kubeadminClient.HasController.GetComponent(symlinkComponentName, testNamespace)
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(kubeadminClient.HasController.WaitForComponentPipelineToBeFinished(component, "",
-				kubeadminClient.TektonController, &has.RetryOptions{Retries: 0}, nil)).Should(MatchError(ContainSubstring("cloned repository contains symlink pointing outside of the cloned repository")))
+			Expect(kubeadminClient.HasController.WaitForComponentPipelineToBeFinished(component, "", 2, f.AsKubeAdmin.TektonController)).Should(MatchError(ContainSubstring("cloned repository contains symlink pointing outside of the cloned repository")))
 		})
 
 	})
 })
-
-func getImageWithDigest(c *framework.ControllerHub, componentName, applicationName, namespace string) (string, error) {
-	var url string
-	var digest string
-	pipelineRun, err := c.HasController.GetComponentPipelineRun(componentName, applicationName, namespace, "")
-	if err != nil {
-		return "", err
-	}
-
-	for _, p := range pipelineRun.Spec.Params {
-		if p.Name == "output-image" {
-			url = p.Value.StringVal
-		}
-	}
-	if url == "" {
-		return "", fmt.Errorf("output-image of a component %q could not be found", componentName)
-	}
-
-	for _, r := range pipelineRun.Status.PipelineRunStatusFields.Results {
-		if r.Name == "IMAGE_DIGEST" {
-			digest = r.Value.StringVal
-		}
-	}
-	if digest == "" {
-		return "", fmt.Errorf("IMAGE_DIGEST for component %q could not be found", componentName)
-	}
-	return fmt.Sprintf("%s@%s", url, digest), nil
-}
-
-// this function takes a bundle and prefetchInput value as inputs and creates a bundle with param hermetic=true
-// and then push the bundle to quay using format: quay.io/<QUAY_E2E_ORGANIZATION>/test-images:<generated_tag>
-func enableHermeticBuildInPipelineBundle(customDockerBuildBundle, pipelineBundleName, prefetchInput string) (string, error) {
-	var tektonObj runtime.Object
-	var err error
-	var newPipelineYaml []byte
-	// Extract docker-build pipeline as tekton object from the bundle
-	if tektonObj, err = tekton.ExtractTektonObjectFromBundle(customDockerBuildBundle, "pipeline", pipelineBundleName); err != nil {
-		return "", fmt.Errorf("failed to extract the Tekton Pipeline from bundle: %+v", err)
-	}
-	dockerPipelineObject := tektonObj.(*tektonpipeline.Pipeline)
-	// Update hermetic params value to true and also update prefetch-input param value
-	for i := range dockerPipelineObject.PipelineSpec().Params {
-		if dockerPipelineObject.PipelineSpec().Params[i].Name == "hermetic" {
-			dockerPipelineObject.PipelineSpec().Params[i].Default.StringVal = "true"
-		}
-		if dockerPipelineObject.PipelineSpec().Params[i].Name == "prefetch-input" {
-			dockerPipelineObject.PipelineSpec().Params[i].Default.StringVal = prefetchInput
-		}
-	}
-	if newPipelineYaml, err = yaml.Marshal(dockerPipelineObject); err != nil {
-		return "", fmt.Errorf("error when marshalling a new pipeline to YAML: %v", err)
-	}
-	keychain := authn.NewMultiKeychain(authn.DefaultKeychain)
-	authOption := remoteimg.WithAuthFromKeychain(keychain)
-	tag := fmt.Sprintf("%d-%s", time.Now().Unix(), util.GenerateRandomString(4))
-	quayOrg := utils.GetEnv(constants.QUAY_E2E_ORGANIZATION_ENV, constants.DefaultQuayOrg)
-	newDockerBuildPipelineImg := strings.ReplaceAll(constants.DefaultImagePushRepo, constants.DefaultQuayOrg, quayOrg)
-	var newDockerBuildPipeline, _ = name.ParseReference(fmt.Sprintf("%s:pipeline-bundle-%s", newDockerBuildPipelineImg, tag))
-	// Build and Push the tekton bundle
-	if err = tekton.BuildAndPushTektonBundle(newPipelineYaml, newDockerBuildPipeline, authOption); err != nil {
-		return "", fmt.Errorf("error when building/pushing a tekton pipeline bundle: %v", err)
-	}
-	return newDockerBuildPipeline.String(), nil
-}
-
-// this function takes a bundle and additonalTags string slice as inputs
-// and creates a bundle with adding ADDITIONAL_TAGS params in the apply-tags task
-// and then push the bundle to quay using format: quay.io/<QUAY_E2E_ORGANIZATION>/test-images:<generated_tag>
-func applyAdditionalTagsInPipelineBundle(customDockerBuildBundle string, pipelineBundleName string, additionalTags []string) (string, error) {
-	var tektonObj runtime.Object
-	var err error
-	var newPipelineYaml []byte
-	// Extract docker-build pipeline as tekton object from the bundle
-	if tektonObj, err = tekton.ExtractTektonObjectFromBundle(customDockerBuildBundle, "pipeline", pipelineBundleName); err != nil {
-		return "", fmt.Errorf("failed to extract the Tekton Pipeline from bundle: %+v", err)
-	}
-	dockerPipelineObject := tektonObj.(*tektonpipeline.Pipeline)
-	// Update ADDITIONAL_TAGS params arrays with additionalTags in apply-tags task
-	for i := range dockerPipelineObject.PipelineSpec().Tasks {
-		t := &dockerPipelineObject.PipelineSpec().Tasks[i]
-		if t.Name == "apply-tags" {
-			t.Params = append(t.Params, tektonpipeline.Param{Name: "ADDITIONAL_TAGS", Value: *tektonpipeline.NewStructuredValues(additionalTags[0], additionalTags[1:]...)})
-		}
-	}
-
-	if newPipelineYaml, err = yaml.Marshal(dockerPipelineObject); err != nil {
-		return "", fmt.Errorf("error when marshalling a new pipeline to YAML: %v", err)
-	}
-	keychain := authn.NewMultiKeychain(authn.DefaultKeychain)
-	authOption := remoteimg.WithAuthFromKeychain(keychain)
-	tag := fmt.Sprintf("%d-%s", time.Now().Unix(), util.GenerateRandomString(4))
-	quayOrg := utils.GetEnv(constants.QUAY_E2E_ORGANIZATION_ENV, constants.DefaultQuayOrg)
-	newDockerBuildPipelineImg := strings.ReplaceAll(constants.DefaultImagePushRepo, constants.DefaultQuayOrg, quayOrg)
-	var newDockerBuildPipeline, _ = name.ParseReference(fmt.Sprintf("%s:pipeline-bundle-%s", newDockerBuildPipelineImg, tag))
-	// Build and Push the tekton bundle
-	if err = tekton.BuildAndPushTektonBundle(newPipelineYaml, newDockerBuildPipeline, authOption); err != nil {
-		return "", fmt.Errorf("error when building/pushing a tekton pipeline bundle: %v", err)
-	}
-	return newDockerBuildPipeline.String(), nil
-}
-
-func ensureOriginalDockerfileIsPushed(hub *framework.ControllerHub, pr *tektonpipeline.PipelineRun) {
-	binaryImage := build.GetBinaryImage(pr)
-	Expect(binaryImage).ShouldNot(BeEmpty())
-
-	binaryImageRef, err := reference.Parse(binaryImage)
-	Expect(err).Should(Succeed())
-
-	tagInfo, err := build.GetImageTag(binaryImageRef.Namespace, binaryImageRef.Name, binaryImageRef.Tag)
-	Expect(err).Should(Succeed())
-
-	dockerfileImageTag := fmt.Sprintf("%s.dockerfile", strings.Replace(tagInfo.ManifestDigest, ":", "-", 1))
-
-	dockerfileImage := reference.DockerImageReference{
-		Registry:  binaryImageRef.Registry,
-		Namespace: binaryImageRef.Namespace,
-		Name:      binaryImageRef.Name,
-		Tag:       dockerfileImageTag,
-	}.String()
-	exists, err := build.DoesTagExistsInQuay(dockerfileImage)
-	Expect(err).Should(Succeed())
-	Expect(exists).Should(BeTrue(), fmt.Sprintf("image doesn't exist: %s", dockerfileImage))
-
-	// Ensure the original Dockerfile used for build was pushed
-	c := hub.CommonController.KubeRest()
-	originDockerfileContent, err := build.ReadDockerfileUsedForBuild(c, hub.TektonController, pr)
-	Expect(err).Should(Succeed())
-
-	storePath, err := oras.PullArtifacts(dockerfileImage)
-	Expect(err).Should(Succeed())
-	entries, err := os.ReadDir(storePath)
-	Expect(err).Should(Succeed())
-	for _, entry := range entries {
-		if entry.Type().IsRegular() && entry.Name() == "Dockerfile" {
-			content, err := os.ReadFile(filepath.Join(storePath, entry.Name()))
-			Expect(err).Should(Succeed())
-			Expect(string(content)).Should(Equal(string(originDockerfileContent)))
-			return
-		}
-	}
-
-	Fail(fmt.Sprintf("Dockerfile is not found from the pulled artifacts for %s", dockerfileImage))
-}
